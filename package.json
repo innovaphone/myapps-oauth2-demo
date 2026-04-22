@@ -1,0 +1,17 @@
+{
+  "name": "innovaphone-sso-cli-demo",
+  "version": "0.1.0",
+  "description": "Node.js CLI demo for innovaphone myApps OAuth2/SSO login with reusable session credentials",
+  "main": "cli.js",
+  "bin": {
+    "innovaphone-sso-demo": "./cli.js"
+  },
+  "type": "commonjs",
+  "scripts": {
+    "start": "node cli.js",
+    "check": "node --check cli.js"
+  },
+  "dependencies": {
+    "ws": "^8.18.3"
+  }
+}

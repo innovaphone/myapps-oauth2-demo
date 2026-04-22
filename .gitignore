@@ -137,3 +137,7 @@ dist
 # Vite logs files
 vite.config.js.timestamp-*
 vite.config.ts.timestamp-*
+
+# Session credentials (contains decrypted PBX session tokens - never commit!)
+.innovaphone-session.json
+.session.json
