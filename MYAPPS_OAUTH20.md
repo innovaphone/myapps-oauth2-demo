@@ -32,9 +32,9 @@ Client                          PBX                              IdP (Keycloak/A
   |<-- Authorize (2FA code) ------|  (if 2FA enabled)                |
   |                               |                                  |
   |<-- LoginResult ----------------|  (success + session credentials)|
-  |    [info.keyShare, info.session]                                  |
+  |    [info.keyShare, info.session, digest]                          |
   |                               |                                  |
-  |  [Decrypt session, save to file]                                 |
+  |  [Verify digest, decrypt session, save to file]                  |
   |                               |                                  |
 ```
 
@@ -101,7 +101,7 @@ Client -> PBX:
   "mt": "Login",
   "type": "user",
   "method": "oauth2",
-  "nonce": "8-byte-random-hex",
+  "nonce": "16-char-hex-random-nonce",
   "keyShare": "128-char-hex-uncompressed-public-key",
   "userAgent": "myApps (Windows)"
 }
@@ -136,7 +136,7 @@ PBX -> Client:
   "method": "oauth2",
   "domain": "example.com",
   "url": "https://keycloak.example.com/realms/.../auth?client_id=innovaphone&...",
-  "challenge": "8-byte-random-hex"
+  "challenge": "opaque-challenge-string"
 }
 ```
 
@@ -208,7 +208,46 @@ function computeSharedSecret(ecdh, peerKeyShareHex) {
 // sharedSecret is 32 bytes = 64 hex characters
 ```
 
-#### Step 2.7: Decrypting Session Credentials
+#### Step 2.7: Verifying the OAuth2 LoginResult Digest
+
+After receiving `LoginResult`, the client now verifies the PBX-provided digest before trusting `info` or saving the session. For OAuth2, the digest password is the ECDHE shared secret and the digest username is the SIP URI from `info.user.sip`.
+
+The current `cli.js` also accepts legacy/protocol-compatible flat user fields by checking `info.sip` if `info.user.sip` is not present.
+
+```javascript
+function getInfoSip(info) {
+  return info && (info.sip || (info.user && info.user.sip));
+}
+
+function buildLoginResultDigest(domain, username, password, nonce, challenge, info) {
+  return sha256Hex(
+    `innovaphoneAppClient:loginresult:${domain}:${username}:${password}:${nonce}:${challenge}:${JSON.stringify(info)}`
+  );
+}
+
+const sharedSecretHex = computeSharedSecret(ecdh, info.keyShare);
+const username = getInfoSip(info);             // usually info.user.sip on current PBX versions
+
+if (!username) throw new Error('OAuth2 LoginResult did not contain a SIP user.');
+if (!loginResult.digest) throw new Error('OAuth2 LoginResult did not contain digest.');
+
+const expectedDigest = buildLoginResultDigest(
+  authenticate.domain,
+  username,
+  sharedSecretHex,
+  oauthLoginNonce,
+  authenticate.challenge,
+  info
+);
+
+if (expectedDigest !== loginResult.digest) {
+  throw new Error('OAuth2 LoginResult digest verification failed.');
+}
+```
+
+This was verified against a real PBX with `info.user.sip` and a valid OAuth2 `LoginResult.digest`.
+
+#### Step 2.8: Decrypting Session Credentials
 
 The session credentials are encrypted using RC4 with a key derived from the ECDHE shared secret.
 
@@ -247,9 +286,9 @@ const sessionUsername = rc4Decrypt(rc4KeyUser, info.session.usr).toString('utf8'
 const sessionPassword = rc4Decrypt(rc4KeyPwd,  info.session.pwd).toString('utf8');
 ```
 
-**Important:** The `nonce` here is the one from the *second* Login message (the one sent with `type:user, method:oauth2, nonce, keyShare`). The original `nonce` from the first message is not used for session decryption.
+**Important:** The `nonce` here is the one from the OAuth2 `Login` message sent with `type:user`, `method:oauth2`, `nonce` and `keyShare`.
 
-#### Step 2.8: Saving the Session
+#### Step 2.9: Saving the Session
 
 ```json
 {
@@ -294,7 +333,7 @@ PBX -> Client:
   "type": "session",
   "method": "digest",
   "domain": "example.com",
-  "challenge": "8-byte-random-hex"
+  "challenge": "opaque-challenge-string"
 }
 ```
 
@@ -349,9 +388,9 @@ PBX -> Client:
 }
 ```
 
-#### Step 3.7: Verify LoginResult Digest (Optional)
+#### Step 3.7: Verify LoginResult Digest
 
-The PBX includes a digest to prove the response authenticity. For session login, we can verify it:
+The PBX includes a digest to prove the response authenticity and protect the integrity of `info`. For session login, the current CLI verifies it if the PBX provides it:
 
 ```javascript
 function buildLoginResultDigest(domain, username, password, nonce, challenge, info) {
@@ -363,7 +402,7 @@ function buildLoginResultDigest(domain, username, password, nonce, challenge, in
 // Verify: computed digest === msg.digest
 ```
 
-**Note:** JSON.stringify must match the PBX's serialization exactly. For OAuth2, digest verification is not possible because we don't know the username until after login.
+**Note:** `JSON.stringify(info)` must match the PBX's serialization exactly. The SDK documentation states that JavaScript `JSON.stringify()` is the expected encoding. OAuth2 digest verification is possible after receiving `LoginResult`, because the username is available as `info.user.sip` (or legacy `info.sip`) and the password is the ECDHE shared secret derived from `info.keyShare`.
 
 ---
 
@@ -379,14 +418,22 @@ SHA256("innovaphoneAppClient:<type>:<domain>:<username>:<password>:<nonce>:<chal
 - `<domain>`: From Authenticate message (e.g., "example.com")
 - `<username>`: Session ID for session login, SIP URI for user login
 - `<password>`: Session password for session login, user password for user login
-- `<nonce>`: 8-byte random hex from client
-- `<challenge>`: 8-byte random hex from Authenticate message
+- `<nonce>`: 16-character hex string encoding 8 random bytes from the client
+- `<challenge>`: opaque challenge string from the Authenticate message
 
 ### LoginResult Digest (for verifying LoginResult)
 
 ```
 SHA256("innovaphoneAppClient:loginresult:<domain>:<username>:<password>:<nonce>:<challenge>:<info-json>")
 ```
+
+For OAuth2:
+
+- `<username>`: `LoginResult.info.user.sip` on current PBX versions, or `LoginResult.info.sip` for legacy flat `Info` objects
+- `<password>`: ECDHE shared secret calculated from the client private key and `LoginResult.info.keyShare`
+- `<nonce>`: the nonce sent in the OAuth2 `Login` message
+- `<challenge>`: the challenge from the OAuth2 `Authenticate` message
+- `<info-json>`: `JSON.stringify(LoginResult.info)`
 
 ### Redirect Digest (for verifying Redirect)
 
@@ -421,7 +468,7 @@ if (auth.mt === 'LoginResult' && auth.error === 5) {
 
 2. **Shared secret never leaves the client** - The ECDHE key exchange ensures the shared secret is computed locally and never transmitted.
 
-3. **Digest verification** proves the server knows the shared secret and that the response hasn't been tampered with.
+3. **Digest verification** proves the server knows the shared secret and that the response hasn't been tampered with. The CLI now requires OAuth2 `LoginResult.digest` to be present and valid before it saves session credentials.
 
 4. **Nonce prevents replay attacks** - Each login uses a fresh random nonce.
 
@@ -488,7 +535,8 @@ PBX -> Client:
       "sip": "usr",
       "dn": "User One"
     }
-  }
+  },
+  "digest": "sha256-hex-string"
 }
 ```
 
@@ -542,6 +590,9 @@ Receive Authorize (2FA code) or proceed
   |
   v
 Receive LoginResult with session credentials
+  |
+  v
+Verify LoginResult digest using info.user.sip and ECDHE shared secret
   |
   v
 Decrypt session with ECDHE shared secret

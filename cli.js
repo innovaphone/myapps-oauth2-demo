@@ -153,6 +153,14 @@ function buildRedirectDigest(username, password, nonce, challenge, infoObject) {
   return sha256Hex(`innovaphoneAppClient:redirect:${username}:${password}:${nonce}:${challenge}:${JSON.stringify(infoObject)}`);
 }
 
+function infoSip(info) {
+  return info && (info.sip || (info.user && info.user.sip));
+}
+
+function infoDisplayName(info) {
+  return info && (info.dn || (info.user && info.user.dn));
+}
+
 function readJsonFile(filePath) {
   try {
     return JSON.parse(fs.readFileSync(filePath, 'utf8'));
@@ -460,11 +468,7 @@ class InnovaphoneSsoCliDemo {
       }
 
       // Use user info from response if available, otherwise fallback to session id
-      const userLabel = msg.info && msg.info.user && msg.info.user.sip 
-        ? msg.info.user.sip 
-        : (msg.info && msg.info.user && msg.info.user.dn 
-           ? msg.info.user.dn 
-           : session.username);
+      const userLabel = infoSip(msg.info) || infoDisplayName(msg.info) || session.username;
 
       return {
         wsUrl,
@@ -572,10 +576,29 @@ class InnovaphoneSsoCliDemo {
       }
 
       const sharedSecretHex = computeSharedSecretHex(ecdh, msg.info.keyShare);
-      
-      // For OAuth2, the PBX has already authenticated the user via the IdP.
-      // We trust the result and just use the username from the response.
-      const username = msg.info.user && msg.info.user.sip ? msg.info.user.sip : 'unknown';
+      const username = infoSip(msg.info);
+
+      if (!username) {
+        throw new Error('OAuth2 LoginResult did not contain info.user.sip or info.sip.');
+      }
+
+      if (!auth.domain) {
+        throw new Error('OAuth2 Authenticate did not contain domain.');
+      }
+
+      if (!auth.challenge) {
+        throw new Error('OAuth2 Authenticate did not contain challenge.');
+      }
+
+      if (!msg.digest) {
+        throw new Error('OAuth2 LoginResult did not contain digest.');
+      }
+
+      const expectedDigest = buildLoginResultDigest(auth.domain, username, sharedSecretHex, nonce, auth.challenge, msg.info);
+      if (expectedDigest !== msg.digest) {
+        throw new Error('OAuth2 LoginResult digest verification failed.');
+      }
+
       console.log(`[info] OAuth2 login successful for user: ${username}`);
 
       const session = this.extractSessionFromInfo(msg.info, nonce, sharedSecretHex);
@@ -587,23 +610,29 @@ class InnovaphoneSsoCliDemo {
       return {
         wsUrl,
         session,
-        userLabel: msg.info.user && msg.info.user.sip ? msg.info.user.sip : (msg.info.user && msg.info.user.dn ? msg.info.user.dn : username)
+        userLabel: username || infoDisplayName(msg.info) || 'unknown'
       };
     }
   }
 
   getOauthUserCandidates(info) {
     const set = new Set();
-    if (typeof info.sip === 'string' && info.sip) set.add(info.sip);
-    if (typeof info.email === 'string' && info.email) set.add(info.email);
-    if (typeof info.dn === 'string' && info.dn) set.add(info.dn);
+    if (!info) return [];
+
+    const user = info.user || info;
+    if (typeof user.sip === 'string' && user.sip) set.add(user.sip);
+    if (typeof user.email === 'string' && user.email) set.add(user.email);
+    if (typeof user.dn === 'string' && user.dn) set.add(user.dn);
     return Array.from(set);
   }
 
   findMatchingLoginResultUsername(domain, candidates, sharedSecretHex, nonce, challenge, msg) {
-    // For OAuth2, we trust the PBX and just use the first candidate since we can't verify the digest
-    // The PBX has already authenticated the user via OAuth2
-    return candidates.length > 0 ? candidates[0] : null;
+    if (!msg.digest) return null;
+    for (const candidate of candidates) {
+      const expected = buildLoginResultDigest(domain, candidate, sharedSecretHex, nonce, challenge, msg.info);
+      if (expected === msg.digest) return candidate;
+    }
+    return null;
   }
 
   findMatchingRedirectUsername(candidates, sharedSecretHex, nonce, challenge, msg) {
